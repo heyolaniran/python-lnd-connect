@@ -40,7 +40,7 @@ python -m grpc_tools.protoc --proto_path=. --python_out=. --grpc_python_out=. li
 # Create .env file if it doesn't exist
 if [ ! -f ".env" ]; then
     echo "📝 Creating .env file..."
-    cp .env .env.example
+    cp .env.example .env
     echo "✅ Created .env file. Please edit it with your LND configuration."
 else
     echo "⚠️  .env file already exists"

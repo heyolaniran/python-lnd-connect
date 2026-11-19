@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import binascii
 import grpc
 import os
 import codecs
@@ -75,6 +75,7 @@ class Config:
 
     @classmethod
     def load(cls):
+        cls.nodes.clear()
         node_1_defaults = {
             "host": os.getenv("LND_HOST", "localhost:10009"),
             "tls_cert_path": os.getenv("LND_TLS_CERT_PATH", "~/.lnd/tls.cert"),
@@ -110,14 +111,14 @@ config.validate()
 
 
 class InvoiceRequest(BaseModel):
-    amount: int
+    amount: int = Field(ge=0, description="Invoice amount in satoshis")
     memo: Optional[str] = ""
-    expiry: Optional[int] = 3600
+    expiry: Optional[int] = Field(default=3600, ge=0)
 
 
 class PaymentRequest(BaseModel):
-    payment_request: str
-    amount: Optional[int] = None
+    payment_request: str = Field(min_length=1)
+    amount: Optional[int] = Field(default=None, ge=1)
 
 
 class WalletInfo(BaseModel):
@@ -132,7 +133,13 @@ class WalletInfo(BaseModel):
 
 
 class SignMessageRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1)
+
+
+class VerifyMessageRequest(BaseModel):
+    message: str = Field(min_length=1)
+    signature: str = Field(min_length=1)
+    pubkey: str = Field(min_length=1)
 
 
 class LNDConnection:
@@ -174,7 +181,7 @@ class LNDConnection:
 
     def create_invoice(self, amount: int, memo: str = "", expiry: int = 3600):
         try:
-            request = ln.Invoice(value=amount, memo=memo, expiry=expiry)
+            request = ln.Invoice(value=amount, memo=memo or "", expiry=expiry or 3600)
             return self.stub.AddInvoice(request, metadata=self._get_metadata())
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to create invoice: {str(e)}")
@@ -182,14 +189,19 @@ class LNDConnection:
     def lookup_invoice(self, r_hash: str):
         try:
             r_hash_bytes = codecs.decode(r_hash, "hex")
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid invoice hash: expected 32-byte hex string")
+        if len(r_hash_bytes) != 32:
+            raise HTTPException(status_code=400, detail="Invalid invoice hash: expected 32-byte hex string")
+        try:
             request = ln.PaymentHash(r_hash=r_hash_bytes)
             return self.stub.LookupInvoice(request, metadata=self._get_metadata())
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to lookup invoice: {str(e)}")
 
-    def send_payment(self, payment_request: str, amount: int = None):
+    def send_payment(self, payment_request: str, amount: Optional[int] = None):
         try:
-            request = ln.SendRequest(payment_request=payment_request, amt=amount)
+            request = ln.SendRequest(payment_request=payment_request, amt=amount or 0)
             return self.stub.SendPaymentSync(request, metadata=self._get_metadata())
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to send payment: {str(e)}")
@@ -278,7 +290,13 @@ class LNDConnectionManager:
                 status_code=503,
                 detail=f"Node '{node_id}' is unavailable: {self.errors[node_id]}",
             )
-        return self.connections[node_id]
+        connection = self.connections.get(node_id)
+        if connection is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Node '{node_id}' is not connected",
+            )
+        return connection
 
     def list_nodes(self):
         result = []
@@ -366,7 +384,17 @@ def _invoice_payload(invoice):
 def _amount_sat(amount) -> int:
     if amount is None:
         return 0
+    if isinstance(amount, int):
+        return amount
     return getattr(amount, "sat", 0) or 0
+
+
+def _enum_name(enum_type, value, prefix: str = "") -> str:
+    """Return the proto enum name for an int value without raising on unknowns."""
+    try:
+        return enum_type.Name(value)
+    except ValueError:
+        return f"{prefix}UNKNOWN_{value}" if prefix else f"UNKNOWN_{value}"
 
 
 def _channel_payload(channel):
@@ -406,7 +434,7 @@ def _pending_channel_base(channel):
         "outbound_liquidity": channel.local_balance,
         "inbound_liquidity": channel.remote_balance,
         "private": channel.private,
-        "initiator": channel.initiator.name if channel.initiator else None,
+        "initiator": _enum_name(ln.Initiator, channel.initiator) if channel.initiator else None,
         "chan_status_flags": channel.chan_status_flags,
         "memo": channel.memo,
     }
@@ -493,7 +521,7 @@ def _channels_payload(
 
 
 @app.get("/")
-async def root():
+def root():
     return {
         "message": "LND Lightning API Server",
         "version": "1.1.0",
@@ -507,50 +535,50 @@ async def root():
 
 
 @app.get("/nodes")
-async def list_nodes():
+def list_nodes():
     return {"nodes": lnd_manager.list_nodes(), "max_nodes": MAX_NODES}
 
 
 @app.get("/health")
-async def health_check_default():
+def health_check_default():
     lnd = lnd_manager.get("1")
     return _health_payload(lnd, "1")
 
 
 @app.get("/nodes/{node_id}/health")
-async def health_check(node_id: str):
+def health_check(node_id: str):
     lnd = lnd_manager.get(node_id)
     return _health_payload(lnd, node_id)
 
 
 @app.get("/info", response_model=WalletInfo)
-async def get_node_info_default():
+def get_node_info_default():
     return _wallet_info(lnd_manager.get("1"))
 
 
 @app.get("/nodes/{node_id}/info", response_model=WalletInfo)
-async def get_node_info(node_id: str):
+def get_node_info(node_id: str):
     return _wallet_info(lnd_manager.get(node_id))
 
 
 @app.get("/balance")
-async def get_balances_default():
+def get_balances_default():
     return _balance_payload(lnd_manager.get("1"))
 
 
 @app.get("/nodes/{node_id}/balance")
-async def get_balances(node_id: str):
+def get_balances(node_id: str):
     return _balance_payload(lnd_manager.get(node_id))
 
 
 @app.get("/channels")
-async def list_channels_default(include_pending: bool = True):
+def list_channels_default(include_pending: bool = True):
     lnd = lnd_manager.get("1")
     return {"node_id": "1", **_channels_payload(lnd, include_pending=include_pending)}
 
 
 @app.get("/nodes/{node_id}/channels")
-async def list_channels(
+def list_channels(
     node_id: str,
     active_only: bool = False,
     inactive_only: bool = False,
@@ -573,12 +601,12 @@ async def list_channels(
 
 
 @app.post("/invoices")
-async def create_invoice_default(invoice_req: InvoiceRequest):
-    return await create_invoice("1", invoice_req)
+def create_invoice_default(invoice_req: InvoiceRequest):
+    return create_invoice("1", invoice_req)
 
 
 @app.post("/nodes/{node_id}/invoices")
-async def create_invoice(node_id: str, invoice_req: InvoiceRequest):
+def create_invoice(node_id: str, invoice_req: InvoiceRequest):
     lnd = lnd_manager.get(node_id)
     response = lnd.create_invoice(
         amount=invoice_req.amount,
@@ -594,24 +622,24 @@ async def create_invoice(node_id: str, invoice_req: InvoiceRequest):
 
 
 @app.get("/invoices/{r_hash}")
-async def get_invoice_default(r_hash: str):
-    return await get_invoice("1", r_hash)
+def get_invoice_default(r_hash: str):
+    return get_invoice("1", r_hash)
 
 
 @app.get("/nodes/{node_id}/invoices/{r_hash}")
-async def get_invoice(node_id: str, r_hash: str):
+def get_invoice(node_id: str, r_hash: str):
     lnd = lnd_manager.get(node_id)
     invoice = lnd.lookup_invoice(r_hash)
     return {"node_id": node_id, **_invoice_payload(invoice)}
 
 
 @app.get("/invoices")
-async def list_invoices_default(limit: int = 100):
-    return await list_invoices("1", limit)
+def list_invoices_default(limit: int = Query(default=100, ge=1, le=1000)):
+    return list_invoices("1", limit)
 
 
 @app.get("/nodes/{node_id}/invoices")
-async def list_invoices(node_id: str, limit: int = 100):
+def list_invoices(node_id: str, limit: int = Query(default=100, ge=1, le=1000)):
     lnd = lnd_manager.get(node_id)
     invoices = lnd.list_invoices(num_max_invoices=limit)
     return {
@@ -621,12 +649,12 @@ async def list_invoices(node_id: str, limit: int = 100):
 
 
 @app.post("/payments")
-async def send_payment_default(payment_req: PaymentRequest):
-    return await send_payment("1", payment_req)
+def send_payment_default(payment_req: PaymentRequest):
+    return send_payment("1", payment_req)
 
 
 @app.post("/nodes/{node_id}/payments")
-async def send_payment(node_id: str, payment_req: PaymentRequest):
+def send_payment(node_id: str, payment_req: PaymentRequest):
     lnd = lnd_manager.get(node_id)
     response = lnd.send_payment(
         payment_request=payment_req.payment_request,
@@ -649,12 +677,12 @@ async def send_payment(node_id: str, payment_req: PaymentRequest):
 
 
 @app.get("/payments")
-async def list_payments_default(limit: int = 100):
-    return await list_payments("1", limit)
+def list_payments_default(limit: int = Query(default=100, ge=1, le=1000)):
+    return list_payments("1", limit)
 
 
 @app.get("/nodes/{node_id}/payments")
-async def list_payments(node_id: str, limit: int = 100):
+def list_payments(node_id: str, limit: int = Query(default=100, ge=1, le=1000)):
     lnd = lnd_manager.get(node_id)
     payments = lnd.list_payments(max_payments=limit)
 
@@ -668,7 +696,7 @@ async def list_payments(node_id: str, limit: int = 100):
                 "creation_date": payment.creation_date,
                 "fee": payment.fee,
                 "payment_request": payment.payment_request,
-                "status": payment.status.name,
+                "status": _enum_name(ln.Payment.PaymentStatus, payment.status),
             }
         )
 
@@ -676,12 +704,12 @@ async def list_payments(node_id: str, limit: int = 100):
 
 
 @app.get("/decode/{payment_request}")
-async def decode_payment_request_default(payment_request: str):
-    return await decode_payment_request("1", payment_request)
+def decode_payment_request_default(payment_request: str):
+    return decode_payment_request("1", payment_request)
 
 
 @app.get("/nodes/{node_id}/decode/{payment_request}")
-async def decode_payment_request(node_id: str, payment_request: str):
+def decode_payment_request(node_id: str, payment_request: str):
     lnd = lnd_manager.get(node_id)
     try:
         request = ln.PayReqString(pay_req=payment_request)
@@ -703,48 +731,52 @@ async def decode_payment_request(node_id: str, payment_request: str):
 
 
 @app.post("/signmessage")
-async def sign_message_default(data: SignMessageRequest):
-    return await sign_message("1", data)
+def sign_message_default(data: SignMessageRequest):
+    return sign_message("1", data)
 
 
 @app.post("/nodes/{node_id}/signmessage")
-async def sign_message(node_id: str, data: SignMessageRequest):
+def sign_message(node_id: str, data: SignMessageRequest):
     lnd = lnd_manager.get(node_id)
     msg = data.message
     if not msg:
-        return JSONResponse(content={"error": "Message is required"}, status_code=400)
+        raise HTTPException(status_code=400, detail="Message is required")
 
     try:
         sign_req = ln.SignMessageRequest(msg=msg.encode("utf-8"))
         sign_resp = lnd.stub.SignMessage(sign_req, metadata=lnd._get_metadata())
-        return JSONResponse(content={"node_id": node_id, "signature": sign_resp.signature}, status_code=200)
+        return {"node_id": node_id, "signature": sign_resp.signature}
     except grpc.RpcError as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(status_code=500, detail=f"Failed to sign message: {str(e)}")
 
 
 @app.post("/verifymessage")
-async def verify_message_default(data: dict = Body(...)):
-    return await verify_message("1", data)
+def verify_message_default(data: VerifyMessageRequest):
+    return verify_message("1", data)
 
 
 @app.post("/nodes/{node_id}/verifymessage")
-async def verify_message(node_id: str, data: dict = Body(...)):
+def verify_message(node_id: str, data: VerifyMessageRequest):
     lnd = lnd_manager.get(node_id)
-    msg = data.get("message")
-    signature = data.get("signature")
-    pubkey = data.get("pubkey")
-    if not msg or not signature or not pubkey:
-        return JSONResponse(
-            content={"error": "Message, signature, and pubkey are required"},
-            status_code=400,
-        )
 
     try:
-        verify_req = ln.VerifyMessageRequest(msg=msg.encode("utf-8"), signature=signature)
+        verify_req = ln.VerifyMessageRequest(
+            msg=data.message.encode("utf-8"),
+            signature=data.signature,
+        )
         verify_resp = lnd.stub.VerifyMessage(verify_req, metadata=lnd._get_metadata())
-        return JSONResponse(content={"node_id": node_id, "valid": verify_resp.valid}, status_code=200)
     except grpc.RpcError as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(status_code=500, detail=f"Failed to verify message: {str(e)}")
+
+    recovered_pubkey = verify_resp.pubkey
+    # LND only reports whether the signature is valid; the caller's pubkey must
+    # also match the key recovered from the signature.
+    pubkey_matches = recovered_pubkey.lower() == data.pubkey.strip().lower()
+    return {
+        "node_id": node_id,
+        "valid": bool(verify_resp.valid and pubkey_matches),
+        "pubkey": recovered_pubkey,
+    }
 
 
 if __name__ == "__main__":

@@ -252,6 +252,10 @@ curl -X POST "http://localhost:8000/nodes/1/verifymessage" \
   }'
 ```
 
+`valid` is `true` only when the signature is valid **and** `pubkey` matches the key
+recovered from the signature. The recovered key is returned as `pubkey` so clients
+can compare it themselves.
+
 ## API Documentation
 
 Once the server is running, visit:

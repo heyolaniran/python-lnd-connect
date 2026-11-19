@@ -1,4 +1,6 @@
 fastapi
 uvicorn[standard]
 python-dotenv
-lndgrpc
+grpcio
+protobuf>=6.31.0
+grpcio-tools
